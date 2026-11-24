@@ -3,8 +3,14 @@ import ReactMarkdown from 'react-markdown';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import 'katex/dist/katex.min.css';
+import * as pdfjsLib from 'pdfjs-dist';
 import {
   Camera,
+  Scissors,
+  Unplug,
+  FileText,
+  ChevronLeft,
+  ChevronRight,
   ClipboardPaste,
   Settings,
   Sparkles,
@@ -18,15 +24,26 @@ import {
   KeyRound,
 } from 'lucide-react';
 
+// Vite 환경에서 PDF.js 워커 연결
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+  'pdfjs-dist/build/pdf.worker.min.mjs',
+  import.meta.url
+).toString();
+
 const MODEL_OPTIONS = [
   {
-    id: 'gemini-2.5-flash',
-    name: 'Gemini 2.5 Flash',
-    desc: '빠른 속도 · 가성비 추천 (문제당 약 1~2원)',
+    id: 'gemini-3.5-flash-lite',
+    name: 'Gemini 3.5 Flash-Lite',
+    desc: '가장 빠르고 저렴한 모델 · 일상 문제 풀이 추천',
   },
   {
-    id: 'gemini-2.5-pro',
-    name: 'Gemini 2.5 Pro',
+    id: 'gemini-3.5-flash',
+    name: 'Gemini 3.5 Flash',
+    desc: '속도와 정확도의 균형 · 범용 추천',
+  },
+  {
+    id: 'gemini-3.5-pro',
+    name: 'Gemini 3.5 Pro',
     desc: '고난도 수학·과학·심화 추론 최상위 정확도',
   },
 ];
@@ -53,11 +70,11 @@ export default function App() {
   const [pwInput, setPwInput] = useState('');
   const [pwError, setPwError] = useState('');
 
-  // 개인 API 키 설정 (브라우저에 영구 저장)
+  // 개인 API 키 설정
   const [showSettings, setShowSettings] = useState(false);
   const [useCustomKey, setUseCustomKey] = useState(() => localStorage.getItem('use_custom_key') === 'true');
   const [customApiKey, setCustomApiKey] = useState(() => localStorage.getItem('custom_api_key') || '');
-  const [customModel, setCustomModel] = useState(() => localStorage.getItem('custom_model') || 'gemini-2.5-pro');
+  const [customModel, setCustomModel] = useState(() => localStorage.getItem('custom_model') || 'gemini-3.5-flash');
   const [settingsError, setSettingsError] = useState('');
 
   // 풀이 상태
@@ -69,12 +86,29 @@ export default function App() {
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
 
-  // 화면 캡처 & 드래그 자르기
+  // 1번 기능: 화면 연결 유지
+  const [isScreenConnected, setIsScreenConnected] = useState(false);
+  const streamRef = useRef(null);
+  const hiddenVideoRef = useRef(null);
+
+  // 캡처 모달 자르기 상태
   const [captureSrc, setCaptureSrc] = useState(null);
   const [dragStart, setDragStart] = useState(null);
   const [dragRect, setDragRect] = useState(null);
   const captureImgRef = useRef(null);
 
+  // 2번 기능: 내장 PDF 뷰어 상태
+  const [pdfDoc, setPdfDoc] = useState(null);
+  const [pdfPageNum, setPdfPageNum] = useState(1);
+  const [pdfNumPages, setPdfNumPages] = useState(0);
+  const [pdfFileName, setPdfFileName] = useState('');
+  const [pdfDragStart, setPdfDragStart] = useState(null);
+  const [pdfDragRect, setPdfDragRect] = useState(null);
+  const pdfCanvasRef = useRef(null);
+  const pdfRenderTaskRef = useRef(null);
+  const pdfFileInputRef = useRef(null);
+
+  // 비밀번호 확인
   const handleUnlock = async (e) => {
     e.preventDefault();
     setPwError('');
@@ -109,6 +143,7 @@ export default function App() {
     setShowSettings(false);
   };
 
+  // AI 문제 풀이 요청
   const solveProblem = useCallback(
     async (targetDataUrl) => {
       const src = targetDataUrl || imageDataUrl;
@@ -157,7 +192,10 @@ export default function App() {
   );
 
   const handleImageReady = useCallback(
-    (dataUrl) => {
+    (dataUrl, keepPdfOpen = false) => {
+      if (!keepPdfOpen) {
+        setPdfDoc(null);
+      }
       setImageDataUrl(dataUrl);
       setError('');
       if (autoSolve) solveProblem(dataUrl);
@@ -165,6 +203,7 @@ export default function App() {
     [autoSolve, solveProblem]
   );
 
+  // 전역 Ctrl+V 붙여넣기
   useEffect(() => {
     if (!isUnlocked || captureSrc || showSettings) return;
 
@@ -175,7 +214,7 @@ export default function App() {
         if (item.type.startsWith('image/')) {
           const blob = item.getAsFile();
           const reader = new FileReader();
-          reader.onload = (ev) => handleImageReady(ev.target.result);
+          reader.onload = (ev) => handleImageReady(ev.target.result, false);
           reader.readAsDataURL(blob);
           e.preventDefault();
           break;
@@ -187,32 +226,62 @@ export default function App() {
     return () => window.removeEventListener('paste', handlePaste);
   }, [isUnlocked, captureSrc, showSettings, handleImageReady]);
 
-  const startScreenCapture = async () => {
+  // --- [1번 기능] 화면 연결 유지 및 즉시 자르기 ---
+  const disconnectScreen = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    if (hiddenVideoRef.current) {
+      hiddenVideoRef.current.srcObject = null;
+    }
+    setIsScreenConnected(false);
+  }, []);
+
+  useEffect(() => {
+    return () => disconnectScreen();
+  }, [disconnectScreen]);
+
+  const grabCurrentFrame = () => {
+    const video = hiddenVideoRef.current;
+    if (!video || video.videoWidth === 0) return;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+
+    setCaptureSrc(canvas.toDataURL('image/png'));
+    setDragRect(null);
+  };
+
+  const connectScreen = async () => {
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: { cursor: 'never' },
         audio: false,
       });
 
-      const video = document.createElement('video');
+      streamRef.current = stream;
+      const video = hiddenVideoRef.current;
       video.srcObject = stream;
       await video.play();
-      await new Promise((r) => setTimeout(r, 150));
 
-      const canvas = document.createElement('canvas');
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      canvas.getContext('2d').drawImage(video, 0, 0);
+      // 브라우저 기본 '공유 중지' 버튼 클릭 시 자동 정리
+      stream.getVideoTracks()[0].onended = () => {
+        disconnectScreen();
+      };
 
-      stream.getTracks().forEach((t) => t.stop());
+      setIsScreenConnected(true);
 
-      setCaptureSrc(canvas.toDataURL('image/png'));
-      setDragRect(null);
+      // 연결 직후 바로 첫 번째 자르기 창 열기
+      setTimeout(() => grabCurrentFrame(), 150);
     } catch {
-      // 캡처 취소 시 무시
+      // 사용자가 취소한 경우 무시
     }
   };
 
+  // 캡처 모달 드래그 자르기
   const handleMouseDown = (e) => {
     const rect = captureImgRef.current.getBoundingClientRect();
     const x = e.clientX - rect.left;
@@ -266,7 +335,119 @@ export default function App() {
     setCaptureSrc(null);
     setDragStart(null);
     setDragRect(null);
-    handleImageReady(croppedUrl);
+    handleImageReady(croppedUrl, false);
+  };
+
+  // --- [2번 기능] PDF 열기, 렌더링, 바로 드래그해서 풀기 ---
+  const loadPdfFile = async (file) => {
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const loadedPdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      setPdfDoc(loadedPdf);
+      setPdfNumPages(loadedPdf.numPages);
+      setPdfPageNum(1);
+      setPdfFileName(file.name);
+      setImageDataUrl(null);
+      setError('');
+    } catch {
+      setError('PDF 파일을 불러오지 못했습니다. 암호가 걸려 있거나 손상된 파일인지 확인해 주세요.');
+    }
+  };
+
+  useEffect(() => {
+    if (!pdfDoc || !pdfCanvasRef.current) return;
+
+    let cancelled = false;
+    const renderPage = async () => {
+      if (pdfRenderTaskRef.current) {
+        try {
+          pdfRenderTaskRef.current.cancel();
+        } catch {
+          // ignore
+        }
+      }
+
+      const page = await pdfDoc.getPage(pdfPageNum);
+      if (cancelled) return;
+
+      const viewport = page.getViewport({ scale: 2.0 });
+      const canvas = pdfCanvasRef.current;
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+
+      const renderTask = page.render({
+        canvasContext: canvas.getContext('2d'),
+        viewport,
+      });
+      pdfRenderTaskRef.current = renderTask;
+
+      try {
+        await renderTask.promise;
+      } catch {
+        // 렌더링 취소 시 무시
+      }
+    };
+
+    renderPage();
+    return () => {
+      cancelled = true;
+    };
+  }, [pdfDoc, pdfPageNum]);
+
+  const handlePdfMouseDown = (e) => {
+    const rect = pdfCanvasRef.current.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    setPdfDragStart({ x, y });
+    setPdfDragRect({ x, y, w: 0, h: 0 });
+  };
+
+  const handlePdfMouseMove = (e) => {
+    if (!pdfDragStart) return;
+    const rect = pdfCanvasRef.current.getBoundingClientRect();
+    const curX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+    const curY = Math.max(0, Math.min(e.clientY - rect.top, rect.height));
+    setPdfDragRect({
+      x: Math.min(pdfDragStart.x, curX),
+      y: Math.min(pdfDragStart.y, curY),
+      w: Math.abs(curX - pdfDragStart.x),
+      h: Math.abs(curY - pdfDragStart.y),
+    });
+  };
+
+  const handlePdfMouseUp = () => {
+    if (!pdfDragStart || !pdfDragRect || pdfDragRect.w < 15 || pdfDragRect.h < 15) {
+      setPdfDragStart(null);
+      setPdfDragRect(null);
+      return;
+    }
+
+    const srcCanvas = pdfCanvasRef.current;
+    const scaleX = srcCanvas.width / srcCanvas.clientWidth;
+    const scaleY = srcCanvas.height / srcCanvas.clientHeight;
+
+    const cropCanvas = document.createElement('canvas');
+    cropCanvas.width = pdfDragRect.w * scaleX;
+    cropCanvas.height = pdfDragRect.h * scaleY;
+    cropCanvas
+      .getContext('2d')
+      .drawImage(
+        srcCanvas,
+        pdfDragRect.x * scaleX,
+        pdfDragRect.y * scaleY,
+        pdfDragRect.w * scaleX,
+        pdfDragRect.h * scaleY,
+        0,
+        0,
+        cropCanvas.width,
+        cropCanvas.height
+      );
+
+    const croppedUrl = cropCanvas.toDataURL('image/png');
+    setPdfDragStart(null);
+    setPdfDragRect(null);
+    // PDF 화면은 유지한 채 바로 풀이 요청
+    handleImageReady(croppedUrl, true);
   };
 
   const copyAnswer = () => {
@@ -305,25 +486,69 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col">
+      {/* 화면 공유 스트림 유지용 숨김 비디오 */}
+      <video ref={hiddenVideoRef} autoPlay playsInline muted className="hidden" />
+
+      {/* 숨김 PDF 파일 입력 */}
+      <input
+        ref={pdfFileInputRef}
+        type="file"
+        accept="application/pdf"
+        className="hidden"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) loadPdfFile(file);
+          e.target.value = '';
+        }}
+      />
+
       {/* 상단 바 */}
-      <header className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between">
-        <div className="flex items-center gap-4">
+      <header className="bg-white border-b border-slate-200 px-6 py-3 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2.5">
+          {!isScreenConnected ? (
+            <button
+              onClick={connectScreen}
+              className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold rounded-xl transition shadow-sm"
+            >
+              <Camera className="w-4 h-4" />
+              화면 연결
+            </button>
+          ) : (
+            <>
+              <button
+                onClick={grabCurrentFrame}
+                className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold rounded-xl transition shadow-sm"
+              >
+                <Scissors className="w-4 h-4" />
+                지금 화면 자르기
+              </button>
+              <button
+                onClick={disconnectScreen}
+                className="flex items-center gap-1.5 px-3 py-2 bg-slate-100 hover:bg-red-50 text-slate-600 hover:text-red-600 text-sm font-medium rounded-xl transition"
+                title="화면 공유 연결 끊기"
+              >
+                <Unplug className="w-4 h-4" />
+                연결 끊기
+              </button>
+            </>
+          )}
+
           <button
-            onClick={startScreenCapture}
-            className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold rounded-xl transition shadow-sm"
+            onClick={() => pdfFileInputRef.current?.click()}
+            className="flex items-center gap-2 px-3.5 py-2 bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 text-sm font-medium rounded-xl transition"
           >
-            <Camera className="w-4 h-4" />
-            화면 캡처
+            <FileText className="w-4 h-4 text-indigo-600" />
+            PDF 열기
           </button>
 
-          <label className="flex items-center gap-2 text-sm text-slate-600 cursor-pointer select-none">
+          <label className="flex items-center gap-2 text-sm text-slate-600 cursor-pointer select-none ml-1">
             <input
               type="checkbox"
               checked={autoSolve}
               onChange={(e) => setAutoSolve(e.target.checked)}
               className="w-4 h-4 accent-indigo-600 rounded"
             />
-            붙여넣기 즉시 풀이
+            즉시 풀이
           </label>
         </div>
 
@@ -345,31 +570,66 @@ export default function App() {
 
       {/* 메인 좌우 2단 */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* 왼쪽: PDF 뷰어 또는 이미지 붙여넣기 박스 */}
         <section className="bg-white rounded-2xl border border-slate-200 p-5 flex flex-col">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="font-semibold text-slate-800">문제 이미지</h2>
-            {imageDataUrl && (
-              <div className="flex items-center gap-2">
+          <div className="flex items-center justify-between mb-3 gap-2">
+            <h2 className="font-semibold text-slate-800 truncate">
+              {pdfDoc ? `PDF: ${pdfFileName}` : '문제 이미지'}
+            </h2>
+
+            {pdfDoc ? (
+              <div className="flex items-center gap-1.5 shrink-0">
                 <button
-                  onClick={() => solveProblem(imageDataUrl)}
-                  disabled={loading}
-                  className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 text-xs font-semibold rounded-lg transition"
+                  onClick={() => setPdfPageNum((p) => Math.max(1, p - 1))}
+                  disabled={pdfPageNum <= 1}
+                  className="p-1.5 rounded-lg hover:bg-slate-100 disabled:opacity-30"
                 >
-                  <Sparkles className="w-3.5 h-3.5" />
-                  다시 풀기
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+                <span className="text-xs font-medium text-slate-600 min-w-[48px] text-center">
+                  {pdfPageNum} / {pdfNumPages}
+                </span>
+                <button
+                  onClick={() => setPdfPageNum((p) => Math.min(pdfNumPages, p + 1))}
+                  disabled={pdfPageNum >= pdfNumPages}
+                  className="p-1.5 rounded-lg hover:bg-slate-100 disabled:opacity-30"
+                >
+                  <ChevronRight className="w-4 h-4" />
                 </button>
                 <button
                   onClick={() => {
-                    setImageDataUrl(null);
-                    setAnswer('');
-                    setError('');
+                    setPdfDoc(null);
+                    setPdfFileName('');
                   }}
-                  className="p-1.5 text-slate-400 hover:text-red-500 rounded-lg"
-                  title="지우기"
+                  className="ml-1 px-2.5 py-1 text-xs text-slate-500 hover:text-red-600 hover:bg-red-50 rounded-lg"
                 >
-                  <Trash2 className="w-4 h-4" />
+                  닫기
                 </button>
               </div>
+            ) : (
+              imageDataUrl && (
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => solveProblem(imageDataUrl)}
+                    disabled={loading}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 text-xs font-semibold rounded-lg transition"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    다시 풀기
+                  </button>
+                  <button
+                    onClick={() => {
+                      setImageDataUrl(null);
+                      setAnswer('');
+                      setError('');
+                    }}
+                    className="p-1.5 text-slate-400 hover:text-red-500 rounded-lg"
+                    title="지우기"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              )
             )}
           </div>
 
@@ -378,28 +638,63 @@ export default function App() {
             onDrop={(e) => {
               e.preventDefault();
               const file = e.dataTransfer.files?.[0];
-              if (file && file.type.startsWith('image/')) {
+              if (!file) return;
+              if (file.type === 'application/pdf') {
+                loadPdfFile(file);
+              } else if (file.type.startsWith('image/')) {
                 const reader = new FileReader();
-                reader.onload = (ev) => handleImageReady(ev.target.result);
+                reader.onload = (ev) => handleImageReady(ev.target.result, false);
                 reader.readAsDataURL(file);
               }
             }}
-            className="flex-1 min-h-[400px] border-2 border-dashed border-slate-300 rounded-xl bg-slate-50 flex flex-col items-center justify-center p-4 overflow-hidden"
+            className="flex-1 min-h-[420px] max-h-[75vh] border-2 border-dashed border-slate-300 rounded-xl bg-slate-50 overflow-auto relative flex flex-col items-center justify-start p-3"
           >
-            {imageDataUrl ? (
-              <img src={imageDataUrl} alt="캡처된 문제" className="max-h-[65vh] object-contain rounded-lg" />
+            {pdfDoc ? (
+              <div className="w-full flex flex-col items-center select-none">
+                <p className="text-xs text-indigo-600 font-medium mb-2">
+                  풀고 싶은 문제 위를 마우스로 드래그하면 바로 풀이가 시작됩니다
+                </p>
+                <div className="relative inline-block cursor-crosshair shadow-sm bg-white">
+                  <canvas
+                    ref={pdfCanvasRef}
+                    onMouseDown={handlePdfMouseDown}
+                    onMouseMove={handlePdfMouseMove}
+                    onMouseUp={handlePdfMouseUp}
+                    className="max-w-full h-auto block"
+                  />
+                  {pdfDragRect && (
+                    <div
+                      style={{
+                        left: pdfDragRect.x,
+                        top: pdfDragRect.y,
+                        width: pdfDragRect.w,
+                        height: pdfDragRect.h,
+                      }}
+                      className="absolute border-2 border-indigo-500 bg-indigo-500/20 pointer-events-none"
+                    />
+                  )}
+                </div>
+              </div>
+            ) : imageDataUrl ? (
+              <div className="my-auto">
+                <img src={imageDataUrl} alt="캡처된 문제" className="max-h-[68vh] object-contain rounded-lg" />
+              </div>
             ) : (
-              <div className="text-center text-slate-500 space-y-2">
+              <div className="my-auto text-center text-slate-500 space-y-2 px-4">
                 <ClipboardPaste className="w-10 h-10 mx-auto text-slate-400" />
-                <p className="font-medium text-slate-700">여기에 Ctrl + V 로 붙여넣기</p>
-                <p className="text-xs text-slate-400">
-                  상단 [화면 캡처] 버튼 또는 Win + Shift + S 캡처 후 바로 붙여넣으세요
+                <p className="font-medium text-slate-700">여기에 Ctrl + V 또는 PDF 파일 드래그</p>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  • 상단 [화면 연결]로 다른 창을 한 번 연결해 두고 계속 자르기
+                  <br />
+                  • PDF 문제집을 끌어다 놓고 문제 위를 바로 드래그하기
+                  <br />• Win + Shift + S 캡처 후 Ctrl + V 붙여넣기
                 </p>
               </div>
             )}
           </div>
         </section>
 
+        {/* 오른쪽: AI 해설 출력창 */}
         <section className="bg-white rounded-2xl border border-slate-200 p-5 flex flex-col">
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
@@ -419,7 +714,7 @@ export default function App() {
             )}
           </div>
 
-          <div className="flex-1 min-h-[400px] overflow-y-auto p-4 bg-slate-50 rounded-xl border border-slate-100">
+          <div className="flex-1 min-h-[420px] max-h-[75vh] overflow-y-auto p-4 bg-slate-50 rounded-xl border border-slate-100">
             {loading && (
               <div className="h-full flex flex-col items-center justify-center text-indigo-600 gap-2">
                 <Loader2 className="w-7 h-7 animate-spin" />
@@ -431,7 +726,7 @@ export default function App() {
 
             {!loading && !error && !answer && (
               <div className="h-full flex items-center justify-center text-sm text-slate-400">
-                문제를 붙여넣으면 이곳에 풀이가 표시됩니다.
+                문제를 드래그하거나 붙여넣으면 이곳에 풀이가 표시됩니다.
               </div>
             )}
 
@@ -484,7 +779,7 @@ export default function App() {
         </div>
       )}
 
-      {/* 무료 / 개인 유료(고성능) 설정 모달 */}
+      {/* 무료 / 개인 유료 설정 모달 */}
       {showSettings && (
         <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-xl">
@@ -496,7 +791,6 @@ export default function App() {
             </div>
 
             <div className="space-y-3">
-              {/* 옵션 1: 무료 모드 */}
               <button
                 type="button"
                 onClick={() => {
@@ -515,7 +809,6 @@ export default function App() {
                 </div>
               </button>
 
-              {/* 옵션 2: 개인 API 키 */}
               <button
                 type="button"
                 onClick={() => setUseCustomKey(true)}
@@ -527,11 +820,10 @@ export default function App() {
               >
                 <div className="font-semibold text-slate-800 text-sm">내 API 키로 고성능 모드 (유료/개인)</div>
                 <div className="text-xs text-slate-500 mt-0.5">
-                  한도 제한 없이 최신 Pro 모델 선택 가능 · 브라우저에 자동 저장
+                  한도 제한 없이 최신 모델 선택 가능 · 브라우저에 자동 저장
                 </div>
               </button>
 
-              {/* 개인 키 상세 입력 영역 */}
               {useCustomKey && (
                 <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 space-y-4 mt-2">
                   <div>
